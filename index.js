@@ -36,7 +36,7 @@ app.get("/", (req, res) => {
   res.send("Welcome to the API");
 });
 
-const PORT = 4501;
+const PORT = process.env.PORT || 4501;
 app.listen(PORT, '0.0.0.0', () => {
   console.log('Server running on port 4501');
 });
