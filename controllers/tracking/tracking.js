@@ -1,4 +1,4 @@
-const pool = require('../../config/database');
+const { db, admin } = require('../../config/database');
 
 function generateTrackingId(name, email) {
   const base = (email || name || '').replace(/[^a-zA-Z]/g, '').toUpperCase();
@@ -17,41 +17,52 @@ async function createTracking(req, res) {
 
     // Check if email already exists
     if (email) {
-      const [existing] = await pool.query('SELECT id FROM tracking_ids WHERE email = ?', [email]);
-      if (existing.length > 0) {
+      const existing = await db.collection('tracking_ids').where('email', '==', email).limit(1).get();
+      if (!existing.empty) {
         return res.status(400).json({ error: 'This email is already registered with a tracking ID.' });
       }
     }
 
-    let trackingId = generateTrackingId(name, email);
+    let trackingId;
     let attempts = 0;
-    while (attempts < 3) {
-      try {
-        const [result] = await pool.query(
-          'INSERT INTO tracking_ids (name, phone, email, tracking_id) VALUES (?, ?, ?, ?)',
-          [name, phone, email || null, trackingId]
-        );
-        return res.status(201).json({
-          message: 'Tracking ID created successfully',
-          tracking_id: trackingId,
-          data: {
-            id: result.insertId,
-            name,
-            phone,
-            email: email || null,
-            tracking_id: trackingId
-          }
-        });
-      } catch (e) {
-        if (e && e.code === 'ER_DUP_ENTRY') {
-          trackingId = generateTrackingId(name, email);
-          attempts += 1;
-          continue;
-        }
-        throw e;
+    let isUnique = false;
+
+    // Generate and verify a unique Tracking ID
+    while (attempts < 3 && !isUnique) {
+      trackingId = generateTrackingId(name, email);
+      const checkId = await db.collection('tracking_ids').where('tracking_id', '==', trackingId).limit(1).get();
+      if (checkId.empty) {
+        isUnique = true;
       }
+      attempts++;
     }
-    return res.status(500).json({ error: 'Could not generate unique tracking ID' });
+
+    if (!isUnique) {
+      return res.status(500).json({ error: 'Could not generate unique tracking ID' });
+    }
+
+    // Insert into Firestore
+    const newRecord = {
+      name,
+      phone,
+      email: email || null,
+      tracking_id: trackingId,
+      created_at: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    const result = await db.collection('tracking_ids').add(newRecord);
+
+    return res.status(201).json({
+      message: 'Tracking ID created successfully',
+      tracking_id: trackingId,
+      data: {
+        id: result.id,
+        name,
+        phone,
+        email: email || null,
+        tracking_id: trackingId
+      }
+    });
   } catch (e) {
     return res.status(500).json({ error: 'Internal Server Error', details: e.message });
   }
@@ -59,65 +70,83 @@ async function createTracking(req, res) {
 
 async function getTrackings(req, res) {
   try {
-    const query = `
-      SELECT 
-        t.id, 
-        t.name, 
-        t.phone, 
-        t.email, 
-        t.tracking_id, 
-        t.created_at,
-        u.location,
-        u.estimated_date,
-        u.estimated_time,
-        u.status as status
-      FROM tracking_ids t
-      LEFT JOIN tracking_updates u ON t.id = u.tracking_record_id 
-      AND u.id = (
-          SELECT MAX(id)
-          FROM tracking_updates
-          WHERE tracking_record_id = t.id
-      )
-      ORDER BY t.created_at DESC
-    `;
-    const [rows] = await pool.query(query);
-    return res.status(200).json(rows);
+    // 1. Fetch all tracking IDs, ordered by creation date
+    const trackingSnapshot = await db.collection('tracking_ids').orderBy('created_at', 'desc').get();
+    const results = [];
+
+    // 2. Map over each document to fetch its corresponding latest update
+    await Promise.all(trackingSnapshot.docs.map(async (doc) => {
+      const tData = doc.data();
+      const tId = doc.id;
+
+      const updatesSnapshot = await db.collection('tracking_updates')
+        .where('tracking_record_id', '==', tId)
+        .orderBy('timestamp', 'desc')
+        .limit(1)
+        .get();
+
+      let latestUpdate = {};
+      if (!updatesSnapshot.empty) {
+        latestUpdate = updatesSnapshot.docs[0].data();
+      }
+
+      results.push({
+        id: tId,
+        name: tData.name,
+        phone: tData.phone,
+        email: tData.email,
+        tracking_id: tData.tracking_id,
+        created_at: tData.created_at ? tData.created_at.toDate() : null, 
+        location: latestUpdate.location || null,
+        estimated_date: latestUpdate.estimated_date || null,
+        estimated_time: latestUpdate.estimated_time || null,
+        status: latestUpdate.status || null
+      });
+    }));
+
+    // Re-sort results in memory just in case parallel fetching caused slight misordering
+    results.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+
+    return res.status(200).json(results);
   } catch (e) {
     return res.status(500).json({ error: 'Internal Server Error', details: e.message });
   }
 }
 
 async function deleteTracking(req, res) {
-  const connection = await pool.getConnection();
   try {
-    await connection.beginTransaction();
     const { id } = req.params;
 
     if (!id) {
       return res.status(400).json({ error: 'ID is required' });
     }
 
-    // Delete from tracking_updates first (child table)
-    await connection.query('DELETE FROM tracking_updates WHERE tracking_record_id = ?', [id]);
+    // Initialize a Firestore Batch (NoSQL equivalent of a Transaction)
+    const batch = db.batch();
 
-    // Delete from tracking_ids (parent table)
-    const [result] = await connection.query('DELETE FROM tracking_ids WHERE id = ?', [id]);
-
-    if (result.affectedRows === 0) {
-      await connection.rollback();
+    // 1. Queue deletion of the parent tracking document
+    const trackingRef = db.collection('tracking_ids').doc(id);
+    const trackingDoc = await trackingRef.get();
+    
+    if (!trackingDoc.exists) {
       return res.status(404).json({ error: 'Tracking record not found' });
     }
+    batch.delete(trackingRef);
 
-    await connection.commit();
+    // 2. Find and queue deletion of all child updates
+    const updatesSnapshot = await db.collection('tracking_updates').where('tracking_record_id', '==', id).get();
+    updatesSnapshot.forEach((doc) => {
+      batch.delete(doc.ref);
+    });
+
+    // 3. Commit the batch
+    await batch.commit();
+
     res.status(200).json({ message: 'Tracking record and related updates deleted successfully' });
   } catch (e) {
-    await connection.rollback();
     console.error('Error deleting tracking:', e);
     res.status(500).json({ error: 'Internal Server Error', details: e.message });
-  } finally {
-    connection.release();
-  }
+  } 
 }
 
 module.exports = { createTracking, getTrackings, deleteTracking };
-
