@@ -1,4 +1,4 @@
-const pool = require('../../config/database');
+const { db, admin } = require('../../config/database');
 
 // Add a new status update
 async function addStatusUpdate(req, res) {
@@ -9,30 +9,43 @@ async function addStatusUpdate(req, res) {
       return res.status(400).json({ error: 'Tracking Record ID and Status are required' });
     }
 
-    // Verify the tracking record exists
-    const [exists] = await pool.query('SELECT id, tracking_id FROM tracking_ids WHERE id = ?', [tracking_record_id]);
-    if (exists.length === 0) {
+    // Verify the tracking record exists in the tracking_ids collection
+    const trackingRef = db.collection('tracking_ids').doc(tracking_record_id);
+    const trackingDoc = await trackingRef.get();
+
+    if (!trackingDoc.exists) {
       return res.status(404).json({ error: 'Tracking ID not found' });
     }
     
-    const tracking_id_string = exists[0].tracking_id;
+    // Extract the human-readable tracking_id string
+    const trackingData = trackingDoc.data();
+    const tracking_id_string = trackingData.tracking_id;
 
-    const [result] = await pool.query(
-      'INSERT INTO tracking_updates (tracking_record_id, tracking_id, location, estimated_date, estimated_time, status) VALUES (?, ?, ?, ?, ?, ?)',
-      [tracking_record_id, tracking_id_string, location, estimated_date, estimated_time, status]
-    );
+    // Build the new update document
+    const newUpdate = {
+      tracking_record_id,
+      tracking_id: tracking_id_string,
+      location: location || '',
+      estimated_date: estimated_date || '',
+      estimated_time: estimated_time || '',
+      status,
+      timestamp: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    // Insert into tracking_updates collection
+    const result = await db.collection('tracking_updates').add(newUpdate);
 
     res.status(201).json({
       message: 'Status updated successfully',
       data: {
-        id: result.insertId,
+        id: result.id,
         tracking_record_id,
         tracking_id: tracking_id_string,
         location,
         estimated_date,
         estimated_time,
         status,
-        created_at: new Date()
+        created_at: new Date() // Sending current time back for the frontend payload
       }
     });
   } catch (error) {
@@ -44,14 +57,18 @@ async function addStatusUpdate(req, res) {
 // Get status history for a tracking ID
 async function getStatusHistory(req, res) {
   try {
-    const { tracking_id } = req.params; // Expecting the string tracking_id (e.g., EMAIL12345ABCDE)
+    const { tracking_id } = req.params; 
 
-    const [rows] = await pool.query(
-      `SELECT * FROM tracking_updates 
-       WHERE tracking_id = ? 
-       ORDER BY created_at DESC`,
-      [tracking_id]
-    );
+    // Query Firestore for all updates matching the string ID
+    const snapshot = await db.collection('tracking_updates')
+      .where('tracking_id', '==', tracking_id)
+      .orderBy('timestamp', 'desc')
+      .get();
+
+    const rows = [];
+    snapshot.forEach(doc => {
+      rows.push({ id: doc.id, ...doc.data() });
+    });
 
     res.status(200).json(rows);
   } catch (error) {
@@ -70,14 +87,20 @@ async function updateStatusUpdate(req, res) {
       return res.status(400).json({ error: 'Status Update ID is required' });
     }
 
-    const [result] = await pool.query(
-      'UPDATE tracking_updates SET location = ?, estimated_date = ?, estimated_time = ?, status = ? WHERE id = ?',
-      [location, estimated_date, estimated_time, status, id]
-    );
-
-    if (result.affectedRows === 0) {
+    const updateRef = db.collection('tracking_updates').doc(id);
+    const docSnap = await updateRef.get();
+    
+    if (!docSnap.exists) {
       return res.status(404).json({ error: 'Status update entry not found' });
     }
+
+    // Update the specific document fields
+    await updateRef.update({
+      location: location !== undefined ? location : '',
+      estimated_date: estimated_date !== undefined ? estimated_date : '',
+      estimated_time: estimated_time !== undefined ? estimated_time : '',
+      status: status !== undefined ? status : ''
+    });
 
     res.status(200).json({ message: 'Status entry updated successfully' });
   } catch (error) {
