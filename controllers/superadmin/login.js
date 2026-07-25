@@ -1,4 +1,4 @@
-const pool = require('../../config/database');
+const { db } = require('../../config/database');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
@@ -9,17 +9,21 @@ async function login(req, res) {
   }
 
   try {
-    const [rows] = await pool.query(
-      'SELECT id, name, email, password, user_type FROM users WHERE email = ? LIMIT 1',
-      [email]
-    );
+    // Firestore query: search 'users' collection for matching email
+    const usersRef = db.collection('users');
+    const snapshot = await usersRef.where('email', '==', email).limit(1).get();
 
-    if (!rows.length) return res.status(401).json({ error: 'Invalid credentials' });
+    if (snapshot.empty) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
 
-    const user = rows[0];
+    // Extract user document data and set the document ID
+    const userDoc = snapshot.docs[0];
+    const user = { id: userDoc.id, ...userDoc.data() };
 
-    if (user.user_type && user.user_type !== 'super_admin')
+    if (user.user_type && user.user_type !== 'super_admin') {
       return res.status(403).json({ error: 'Forbidden' });
+    }
 
     let ok = false;
     if (user.password && String(user.password).startsWith('$2')) {
@@ -30,7 +34,7 @@ async function login(req, res) {
 
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
 
-    // generate token
+    // Generate JWT token
     const token = jwt.sign(
       {
         id: user.id,
@@ -61,10 +65,6 @@ async function login(req, res) {
   }
 }
 
-
-
-
 module.exports = {
   login,
- 
 };
